@@ -81,7 +81,7 @@ Scan status labels:
 
 - `local_source_scanned`: local installed/source folder was scanned.
 - `provided_source_scanned`: user-provided local source path was scanned.
-- `remote_source_fetched_and_scanned`: supported GitHub source was fetched into `/private/tmp` and scanned.
+- `remote_source_fetched_and_scanned`: supported GitHub source was fetched into a platform temp directory and scanned.
 - `trusted_source_checked`: trusted marketplace/installer metadata was checked, but source code may still need scanning.
 - `source_url_not_fetched`: a URL exists but was not fetched or cloned in the current environment.
 - `no_source`: no source was available to scan.

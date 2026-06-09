@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])\$?([A-Za-z][A-Za-z0-9_-]{1,63})(?![A-Za-z0-9_-])")
 
 RISK_PATTERNS = [
@@ -54,14 +54,27 @@ def parse_skills_arg(value: str | None) -> list[str]:
 
 def extract_mentions(text: str) -> list[str]:
     mentions: set[str] = set()
-    for raw in TOKEN_RE.findall(text):
-        normalized = normalize_name(raw)
-        if not normalized or len(normalized) < 2:
-            continue
-        if normalized in {"skill", "skills", "must", "have", "best", "top", "new", "old"}:
-            continue
-        if "-" in normalized or raw.startswith("$") or "skill" in normalized:
-            mentions.add(normalized)
+    stopwords = {"skill", "skills", "must", "have", "best", "top", "new", "old"}
+    for line in text.splitlines():
+        for match in TOKEN_RE.finditer(line):
+            raw = match.group(1)
+            token = match.group(0)
+            normalized = normalize_name(raw)
+            if not normalized or len(normalized) < 2 or normalized in stopwords:
+                continue
+
+            raw_has_separator = "-" in raw or "_" in raw
+            explicit_skill_ref = token.startswith("$") or "skill" in normalized
+            looks_like_version_or_id = bool(re.search(r"\d{3,}", raw))
+
+            if looks_like_version_or_id:
+                continue
+
+            # Plain CamelCase product names often normalize into hyphenated words
+            # (NotebookLM -> notebook-lm). Do not treat them as skill candidates
+            # unless the original token is explicitly skill-like.
+            if raw_has_separator or explicit_skill_ref:
+                mentions.add(normalized)
     return sorted(mentions)
 
 
@@ -176,10 +189,12 @@ def github_source_parts(url: str) -> tuple[str, str, str, str] | None:
     if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
         return None
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 5 or parts[2] not in {"blob", "tree"}:
+    if len(parts) < 4 or parts[2] not in {"blob", "tree"}:
         return None
     owner, repo, mode, ref = parts[:4]
-    source_path = "/".join(parts[4:])
+    source_path = "/".join(parts[4:]) if len(parts) > 4 else ""
+    if mode == "blob" and not source_path:
+        return None
     if mode == "blob" and source_path.endswith("/SKILL.md"):
         source_path = source_path[: -len("/SKILL.md")]
     elif mode == "blob" and source_path == "SKILL.md":
@@ -201,7 +216,8 @@ def github_api_json(url: str) -> object:
 
 def download_github_contents(owner: str, repo: str, ref: str, path: str, destination: Path) -> None:
     quoted_path = urllib.parse.quote(path)
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{quoted_path}?ref={urllib.parse.quote(ref)}"
+    contents_path = f"contents/{quoted_path}" if quoted_path else "contents"
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/{contents_path}?ref={urllib.parse.quote(ref)}"
     data = github_api_json(api_url)
     if isinstance(data, dict) and data.get("type") == "file":
         download_url = data.get("download_url")
@@ -235,12 +251,14 @@ def download_github_contents(owner: str, repo: str, ref: str, path: str, destina
             download_github_contents(owner, repo, ref, item_path, destination / rel_path)
 
 
-def fetch_github_source(source: str, candidate: str) -> tuple[Path | None, str | None]:
+def fetch_github_source(source: str, candidate: str, tmp_dir: Path | None = None) -> tuple[Path | None, str | None]:
     parts = github_source_parts(source)
     if not parts:
         return None, "URL is not a supported GitHub blob/tree source"
     owner, repo, ref, source_path = parts
-    destination = Path(tempfile.mkdtemp(prefix=f"skill-advisor-{candidate}-", dir="/private/tmp"))
+    base_tmp = tmp_dir or Path(tempfile.gettempdir())
+    base_tmp.mkdir(parents=True, exist_ok=True)
+    destination = Path(tempfile.mkdtemp(prefix=f"skill-advisor-{candidate}-", dir=str(base_tmp)))
     try:
         download_github_contents(owner, repo, ref, source_path, destination)
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
@@ -259,7 +277,13 @@ def line_is_explanatory(line: str) -> bool:
     return bool(EXPLANATORY_LINE_RE.search(stripped))
 
 
-def audit_candidate(name: str, roots: list[Path], sources: dict[str, str], fetch_remote: bool) -> dict[str, object]:
+def audit_candidate(
+    name: str,
+    roots: list[Path],
+    sources: dict[str, str],
+    fetch_remote: bool,
+    tmp_dir: Path | None = None,
+) -> dict[str, object]:
     normalized = normalize_name(name)
     result: dict[str, object] = {
         "candidate": name,
@@ -286,7 +310,7 @@ def audit_candidate(name: str, roots: list[Path], sources: dict[str, str], fetch
             skill_dir = source_dir
             result["scan_status"] = "provided_source_scanned"
         elif fetch_remote and re.match(r"^https?://", sources[normalized]):
-            fetched_dir, error = fetch_github_source(sources[normalized], normalized)
+            fetched_dir, error = fetch_github_source(sources[normalized], normalized, tmp_dir)
             if fetched_dir:
                 skill_dir = fetched_dir
                 result["scan_status"] = "remote_source_fetched_and_scanned"
@@ -364,7 +388,11 @@ def main() -> int:
     parser.add_argument(
         "--fetch-remote",
         action="store_true",
-        help="Fetch supported GitHub blob/tree sources from --source into /private/tmp before scanning.",
+        help="Fetch supported GitHub blob/tree sources from --source into the platform temp directory before scanning.",
+    )
+    parser.add_argument(
+        "--tmp-dir",
+        help="Directory for temporary remote-source fetches. Defaults to the platform temp directory.",
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON.")
     args = parser.parse_args()
@@ -377,7 +405,8 @@ def main() -> int:
     deduped = sorted({candidate for candidate in candidates if candidate})
     roots = default_roots(args.scan_root)
     sources = parse_source_arg(args.source)
-    results = [audit_candidate(candidate, roots, sources, args.fetch_remote) for candidate in deduped]
+    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else None
+    results = [audit_candidate(candidate, roots, sources, args.fetch_remote, tmp_dir) for candidate in deduped]
     output = {"scan_roots": [str(root) for root in roots], "results": results}
 
     if args.json:
