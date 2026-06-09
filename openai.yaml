@@ -1,0 +1,7 @@
+interface:
+  display_name: "Skill Install Advisor"
+  short_description: "筛选文章推荐的 skills 是否值得安装"
+  default_prompt: "Use $skill-install-advisor to evaluate the skills mentioned in this article or screenshot, shortlist 3-4 candidates, and install the one I choose."
+
+policy:
+  allow_implicit_invocation: true
